@@ -28,6 +28,25 @@ from hyxi_cloud_api.api import HyxiApiClient
 
 
 @pytest.mark.asyncio
+async def test_fetch_device_metrics_request_error(caplog):
+    """Test that _fetch_device_metrics handles errors from _request gracefully."""
+    caplog.set_level(logging.ERROR)
+    mock_session = MagicMock()
+    api = HyxiApiClient("ak", "sk", "https://api.com", mock_session)
+
+    # Mock _request to raise an ValueError directly
+    api._request = AsyncMock(side_effect=ValueError("Mock client error"))
+
+    entry = {"metrics": {}, "device_type_code": "INVERTER"}
+    # Use a longer SN so it's not fully masked to ****
+    await api._fetch_device_metrics("10602251600016", entry)
+
+    assert "Error fetching metrics for fefbfd75: Mock client error" in caplog.text
+    # Ensure it didn't crash and entry was not updated with metrics
+    assert not entry["metrics"]
+
+
+@pytest.mark.asyncio
 async def test_fetch_device_metrics_network_error(caplog):
     """Test that _fetch_device_metrics handles network errors gracefully."""
     caplog.set_level(logging.ERROR)
@@ -128,8 +147,8 @@ async def test_fetch_ems_basic_data_error(caplog):
     mock_session = MagicMock()
     api = HyxiApiClient("ak", "sk", "https://api.com", mock_session)
 
-    # Mock _request to raise an Exception to ensure query_ems_basic_details returns {}
-    api._request = AsyncMock(side_effect=Exception("EMS data fetch failed"))
+    # Mock _request to raise an ValueError to ensure query_ems_basic_details returns {}
+    api._request = AsyncMock(side_effect=ValueError("EMS data fetch failed"))
 
     entry = {"metrics": {}, "device_type_code": "EMS"}
     await api._fetch_ems_basic_data("10602251600016", entry)
@@ -148,8 +167,8 @@ async def test_query_ems_basic_details_error(caplog):
     mock_session = MagicMock()
     api = HyxiApiClient("ak", "sk", "https://api.com", mock_session)
 
-    # Mock _request to raise an Exception to cover the error path in query_ems_basic_details
-    api._request = AsyncMock(side_effect=Exception("EMS query failed"))
+    # Mock _request to raise an ValueError to cover the error path in query_ems_basic_details
+    api._request = AsyncMock(side_effect=ValueError("EMS query failed"))
 
     result = await api.query_ems_basic_details("10602251600016")
 

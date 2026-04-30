@@ -75,7 +75,7 @@ async def test_get_all_device_data_success():
 
 
 @pytest.mark.asyncio
-async def test_get_all_device_data_retry_exhaustion(monkeypatch):
+async def test_get_all_device_data_retry_exhaustion(monkeypatch, caplog):
     """Test that get_all_device_data exhausts retries and returns None."""
     fake_session = MagicMock()
     api = HyxiApiClient("ak", "sk", "https://api.com", fake_session)
@@ -98,6 +98,45 @@ async def test_get_all_device_data_retry_exhaustion(monkeypatch):
 
     # Verify asyncio.sleep was called MAX_RETRIES - 1 times (2)
     assert mock_sleep.call_count == 2
+
+    assert "HYXI Cloud connection failed after 3 attempts" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_all_device_data_auth_failed():
+    """Test that get_all_device_data immediately fails on auth failure."""
+    fake_session = MagicMock()
+    api = HyxiApiClient("ak", "sk", "https://api.com", fake_session)
+
+    api._execute_fetch_all = AsyncMock(return_value="auth_failed")
+
+    result = await api.get_all_device_data()
+
+    assert result is None
+    assert api._execute_fetch_all.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_all_device_data_soft_failure(monkeypatch, caplog):
+    """Test that get_all_device_data manually raises and retries when fetch returns None."""
+    caplog.set_level(logging.DEBUG)
+
+    fake_session = MagicMock()
+    api = HyxiApiClient("ak", "sk", "https://api.com", fake_session)
+
+    # Returning None simulates a soft failure
+    api._execute_fetch_all = AsyncMock(return_value=None)
+
+    mock_sleep = AsyncMock()
+    monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+    result = await api.get_all_device_data()
+
+    assert result is None
+    assert api._execute_fetch_all.call_count == 3
+    assert mock_sleep.call_count == 2
+    assert "Fetch returned None, triggering retry." in caplog.text
+    assert "HYXI Cloud connection failed after 3 attempts" in caplog.text
 
 
 # --- TEST 3: Header Generation and Hashes ---
@@ -212,12 +251,6 @@ async def test_fetch_ems_basic_data_success(caplog):
 
     # Assert entry['metrics'] is updated
     assert entry["metrics"] == {"existing_metric": "value", "new_metric": "new_value"}
-
-    # Assert the correct debug log was emitted
-    assert (
-        "HYXI Raw METRICS for fefbfd75 (EMS) [EMS]: {'new_metric': 'new_value'}"
-        in caplog.text
-    )
 
 
 @pytest.mark.asyncio
@@ -387,18 +420,9 @@ async def test_fetch_alarms_for_plant_sanitization(caplog):
     assert len(alarms) == 2
     assert alarms[0]["deviceSn"] == "10602251600016"  # Ensure return value is intact
 
-    log_text = caplog.text
-
-    # Assert logs do NOT contain sensitive IDs in plain text
-    assert "10602251600016" not in log_text
-    assert "60701251900927" not in log_text
-
-    # Assert logs contain the masked versions
-    assert "fefbfd75" in log_text
-    assert "5a9bda67" in log_text
-
-    # Ensure plant ID itself is masked
-    assert "ef797c81" in log_text
+    # This function previously tested sanitization of the return values
+    # from raw alarm logs. We no longer log "HYXI Raw ALARMS" so we don't
+    # have any debug output to assert on here anymore.
 
 
 @pytest.mark.asyncio
@@ -510,3 +534,20 @@ async def test_execute_fetch_all_null_data():
 
     assert isinstance(results, dict)
     assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_alarms_for_plant_error(caplog):
+    """Test that _fetch_alarms_for_plant handles ClientError correctly."""
+    caplog.set_level(logging.ERROR)
+
+    mock_session = MagicMock()
+    api = HyxiApiClient("ak", "sk", "https://api.com", mock_session)
+    api._request = AsyncMock(side_effect=aiohttp.ClientError("Connection reset"))
+
+    alarms = await api._fetch_alarms_for_plant("12345678")
+
+    assert alarms == []
+
+    log_text = caplog.text
+    assert "Error fetching alarms for plant ef797c81: Connection reset" in log_text

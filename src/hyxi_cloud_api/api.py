@@ -781,7 +781,12 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
             return False
 
         self.token = str(f"Bearer {token_val}")
+        self.token_expires_at = self._calculate_token_expiration(data)
 
+        return True
+
+    def _calculate_token_expiration(self, data: dict) -> float:
+        """Calculate token expiration timestamp from API response."""
         # 1. Grab the raw expiration value exactly as the API sent it
         raw_expires_in = data.get("expiresIn") or data.get("expires_in")
         _LOGGER.debug(
@@ -792,10 +797,10 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
         # 3. Apply the 5-minute (300s) safety buffer
         buffer_secs = 300
         expires_at_val = raw_expires_in or 6600
-        self.token_expires_at = time.time() + float(expires_at_val) - buffer_secs
+        token_expires_at = time.time() + float(expires_at_val) - buffer_secs
 
         # 4. Log the actual scheduled refresh time
-        refresh_time_str = datetime.fromtimestamp(self.token_expires_at).strftime(
+        refresh_time_str = datetime.fromtimestamp(token_expires_at).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
         _LOGGER.debug(
@@ -803,7 +808,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
             int(float(expires_at_val)) - buffer_secs,
             refresh_time_str,
         )
-        return True
+        return token_expires_at
 
     async def _refresh_token(self):
         """Async version of token refresh."""
@@ -828,7 +833,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
                 return False
 
             return self._apply_token_response(res.get("data", {}))
-        except (aiohttp.ClientError, TimeoutError, Exception) as e:
+        except Exception as e:
             _LOGGER.error("HYXI Token Request Failed: %s", e)
         return False
 
@@ -841,13 +846,6 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
             if res_q.get("success"):
                 data_list = res_q.get("data", [])
                 m_raw = _parse_data_list(data_list)
-                if _LOGGER.isEnabledFor(logging.DEBUG):
-                    _LOGGER.debug(
-                        "HYXI Raw METRICS for %s (%s): %s",
-                        _mask_id(sn),
-                        entry.get("device_type_code"),
-                        _sanitize_dict(m_raw),
-                    )
 
                 # 🚀 Sanitization: If this is a Collector, ignore battery/power metrics that shouldn't be here.
                 # This prevents "Collector" entities in Home Assistant from showing ghost battery stats.
@@ -864,7 +862,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
                     _mask_id(sn),
                     res_q.get("message"),
                 )
-        except (aiohttp.ClientError, TimeoutError, Exception) as e:
+        except Exception as e:
             _LOGGER.error("Error fetching metrics for %s: %s", _mask_id(sn), e)
 
     async def _fetch_ems_basic_data(self, ems_sn, entry):
@@ -872,13 +870,6 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
         _LOGGER.debug("HYXI Probing EMS telemetry for %s...", _mask_id(ems_sn))
         m_raw = await self.query_ems_basic_details(ems_sn)
         if m_raw:
-            if _LOGGER.isEnabledFor(logging.DEBUG):
-                _LOGGER.debug(
-                    "HYXI Raw METRICS for %s (%s) [EMS]: %s",
-                    _mask_id(ems_sn),
-                    entry.get("device_type_code", "EMS"),
-                    _sanitize_dict(m_raw),
-                )
             entry["metrics"].update(m_raw)
         else:
             _LOGGER.debug(
@@ -894,11 +885,23 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
             if res.get("code") == "0":
                 data = res.get("data", [])
                 return _parse_ems_kv(data)
-        except (aiohttp.ClientError, TimeoutError, Exception) as e:
+        except Exception as e:
             _LOGGER.error(
                 "HYXI EMS Basic Data Request Failed for %s: %s", _mask_id(ems_sn), e
             )
         return {}
+
+    @staticmethod
+    def _extract_battery_info(i_raw):
+        """Helper to extract battery-specific device info."""
+        return {
+            "batCap": _get_f("batCap", i_raw),
+            "packNum": int(i_raw.get("packNum") or 1),
+            "maxChargePower": _get_f("maxChargePower", i_raw)
+            or _get_f("maxChargingDischargingPower", i_raw),
+            "maxDischargePower": _get_f("maxDischargePower", i_raw)
+            or _get_f("maxChargingDischargingPower", i_raw),
+        }
 
     @staticmethod
     def _extract_device_info_metadata(entry, i_raw):
@@ -923,16 +926,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
 
         device_type_code = entry.get("device_type_code", "").upper()
         if _BATTERY_DEVICE_REGEX.search(device_type_code):
-            base_info.update(
-                {
-                    "batCap": _get_f("batCap", i_raw),
-                    "packNum": int(i_raw.get("packNum") or 1),
-                    "maxChargePower": _get_f("maxChargePower", i_raw)
-                    or _get_f("maxChargingDischargingPower", i_raw),
-                    "maxDischargePower": _get_f("maxDischargePower", i_raw)
-                    or _get_f("maxChargingDischargingPower", i_raw),
-                }
-            )
+            base_info.update(HyxiApiClient._extract_battery_info(i_raw))
 
         entry["metrics"].update(base_info)
         return base_info
@@ -952,12 +946,6 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
                 else:
                     i_raw = {}
 
-                # 👇 This will dump the EXACT info the cloud sends back
-                if _LOGGER.isEnabledFor(logging.DEBUG):
-                    _LOGGER.debug(
-                        "HYXI Raw INFO for %s: %s", _mask_id(sn), _sanitize_dict(i_raw)
-                    )
-
                 base_info = HyxiApiClient._extract_device_info_metadata(entry, i_raw)
                 # Store in cache
                 if sn not in self._discovery_cache["device_info"]:
@@ -975,7 +963,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
                     res_i.get("message"),
                 )
 
-        except (aiohttp.ClientError, TimeoutError, Exception) as e:
+        except Exception as e:
             _LOGGER.error("Error fetching device info for %s: %s", _mask_id(sn), e)
 
     async def _fetch_all_for_device(self, sn, entry, dev_type):
@@ -1036,7 +1024,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
 
             await self._process_devices_for_plant(devices, state)
 
-        except (aiohttp.ClientError, TimeoutError, Exception) as e:
+        except Exception as e:
             _LOGGER.error(
                 "Error fetching devices for plant %s: %s", _mask_id(plant_id), e
             )
@@ -1071,22 +1059,28 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
     async def _fetch_sub_device_list(self, parent_sn: str) -> list[dict]:
         """Fetch the list of sub-devices from the API."""
         sd_path = "/api/device/v1/getSubDevicePage"
-        _, res_sd = await self._request(
-            "POST",
-            sd_path,
-            json={"parentSn": parent_sn, "pageSize": 50, "currentPage": 1},
-        )
+        try:
+            _, res_sd = await self._request(
+                "POST",
+                sd_path,
+                json={"parentSn": parent_sn, "pageSize": 50, "currentPage": 1},
+            )
 
-        if not res_sd.get("success"):
+            if not res_sd.get("success"):
+                _LOGGER.error(
+                    "HYXI API Sub-Device Fetch Rejected for %s: %s",
+                    _mask_id(parent_sn),
+                    _sanitize_dict(res_sd),
+                )
+                return []
+
+            data_val = res_sd.get("data", {})
+            return data_val.get("childDevice", []) if isinstance(data_val, dict) else []
+        except Exception as e:
             _LOGGER.error(
-                "HYXI API Sub-Device Fetch Rejected for %s: %s",
-                _mask_id(parent_sn),
-                _sanitize_dict(res_sd),
+                "Error fetching sub-device list for %s: %s", _mask_id(parent_sn), e
             )
             return []
-
-        data_val = res_sd.get("data", {})
-        return data_val.get("childDevice", []) if isinstance(data_val, dict) else []
 
     async def _fetch_sub_devices(self, parent_sn, state: FetchState):
         """Fetch sub-devices under a communication unit (Collector/DMU)."""
@@ -1118,7 +1112,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
                     self._fetch_all_for_device(sn, entry, raw_type)
                 )
 
-        except (aiohttp.ClientError, TimeoutError, Exception) as e:
+        except Exception as e:
             _LOGGER.error(
                 "Error fetching sub-devices for %s: %s", _mask_id(parent_sn), e
             )
@@ -1150,18 +1144,8 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
                 if alarm_name := ALARM_CODE_MAP.get(code):
                     a["alarmName"] = alarm_name
 
-            # 👇 Dump the EXACT active alarms the cloud sends back
-            if _LOGGER.isEnabledFor(logging.DEBUG):
-                _LOGGER.debug(
-                    "HYXI Raw ALARMS for Plant %s: %s",
-                    _mask_id(plant_id),
-                    [_sanitize_dict(a) for a in alarms]
-                    if isinstance(alarms, list)
-                    else alarms,
-                )
-
             return alarms
-        except (aiohttp.ClientError, TimeoutError, Exception) as e:
+        except Exception as e:
             _LOGGER.error(
                 "Error fetching alarms for plant %s: %s", _mask_id(plant_id), e
             )

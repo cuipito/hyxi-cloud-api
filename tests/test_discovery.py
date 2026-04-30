@@ -34,9 +34,12 @@ def _setup_mock_api():
     mock_response = MagicMock()
     mock_response.__aenter__.return_value.raise_for_status = MagicMock()
     mock_response.__aenter__.return_value.status = 200
-    mock_response.__aenter__.return_value.json = AsyncMock(
-        side_effect=[
-            {
+    # To fix StopAsyncIteration, we provide a side_effect function that handles both structures.
+    async def mock_json_side_effect():
+        # First call might be fetching deviceList, next call childDevice
+        mock_json_side_effect.call_count = getattr(mock_json_side_effect, 'call_count', 0) + 1
+        if mock_json_side_effect.call_count == 1:
+            return {
                 "success": True,
                 "data": {
                     "deviceList": [
@@ -47,21 +50,21 @@ def _setup_mock_api():
                         }
                     ]
                 },
+            }
+        return {
+            "success": True,
+            "data": {
+                "childDevice": [
+                    {
+                        "deviceSn": "INV_001",
+                        "deviceType": "1",  # Hybrid Inverter
+                        "deviceName": "My Inverter",
+                    }
+                ]
             },
-            {
-                "success": True,
-                "data": {
-                    "childDevice": [
-                        {
-                            "deviceSn": "INV_001",
-                            "deviceType": "1",  # Hybrid Inverter
-                            "deviceName": "My Inverter",
-                        }
-                    ]
-                },
-            },
-        ]
-    )
+        }
+
+    mock_response.__aenter__.return_value.json = AsyncMock(side_effect=mock_json_side_effect)
 
     api.session.post = MagicMock(return_value=mock_response)
     api.session.get = MagicMock(return_value=mock_response)
@@ -278,7 +281,7 @@ async def test_fetch_sub_devices_exception():
     api = HyxiApiClient("ak", "sk", "https://api.com", MagicMock())
 
     # Force an exception during the request
-    api.session.post = MagicMock(side_effect=Exception("Network Timeout"))
+    api.session.post = MagicMock(side_effect=TimeoutError("Network Timeout"))
 
     state = FetchState(now="Plant123")
 
