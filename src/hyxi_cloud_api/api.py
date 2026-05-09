@@ -680,8 +680,15 @@ def _sanitize_list(raw_list: list) -> list[Any]:
     return result
 
 
+_PLANT_TYPE_VALUES = {1, 2, 3}
+_STATISTIC_TIME_TYPE_VALUES = {1, 2, 3}
+
+
 class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
     """Client for interacting with the HYXI Cloud API."""
+
+    class PlantError(Exception):
+        """Raised when a plant API request fails."""
 
     def __init__(
         self, access_key, secret_key, base_url, session: aiohttp.ClientSession
@@ -838,6 +845,28 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
             _LOGGER.error("HYXI Token Request Failed: %s", e)
         return False
 
+    async def _authenticated_api_request(
+        self,
+        method: str,
+        path: str,
+        error_cls: type[Exception],
+        failure_context: str,
+        **kwargs,
+    ) -> dict:
+        """Make an authenticated API request and raise a domain error on failure."""
+        token_status = await self._refresh_token()
+        if token_status == "auth_failed":
+            raise error_cls("Authentication failed")
+        if not token_status:
+            raise error_cls("Could not obtain API token")
+
+        _, res = await self._request(method, path, **kwargs)
+        if res is None or not res.get("success"):
+            code = res.get("code", "unknown") if res else "no_response"
+            msg = res.get("msg", "") if res else ""
+            raise error_cls(f"{failure_context} failed (code={code}): {msg}")
+        return res
+
     async def _fetch_device_metrics(self, sn, entry):
         """Helper to fetch detailed metrics for a single device."""
         q_path = "/api/device/v1/queryDeviceData"
@@ -990,11 +1019,10 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
 
     async def _fetch_device_list_for_plant(self, plant_id: str) -> list[dict] | None:
         """Fetch the raw device list from the API for a specific plant."""
-        d_path = "/api/plant/v1/devicePage"
-        _, res_d = await self._request(
-            "POST",
-            d_path,
-            json={"plantId": plant_id, "pageSize": 50, "currentPage": 1},
+        res_d = await self._request_plant_device_page(
+            plant_id=plant_id,
+            page_size=50,
+            current_page=1,
         )
 
         if not res_d.get("success"):
@@ -1200,10 +1228,7 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
 
     async def _fetch_plants(self):
         """Helper to fetch plants associated with the account."""
-        p_path = "/api/plant/v1/page"
-        _, res_p = await self._request(
-            "POST", p_path, json={"pageSize": 10, "currentPage": 1}
-        )
+        res_p = await self._request_plant_page(page_size=10, current_page=1)
 
         if not res_p.get("success"):
             # 🚀 If the server rejects the token, wipe it and force a retry!
@@ -1471,3 +1496,308 @@ class HyxiApiClient:  # pylint: disable=too-many-instance-attributes
         }
 
         return entry, dev_type
+
+    # ── Plant API ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_non_empty(value: str, name: str) -> None:
+        """Validate a required string field."""
+        if not value or not str(value).strip():
+            raise ValueError(f"{name} must be a non-empty string")
+
+    @staticmethod
+    def _validate_page(page_size: int, current_page: int) -> None:
+        """Validate pagination parameters."""
+        if page_size <= 0:
+            raise ValueError("page_size must be a positive integer")
+        if current_page <= 0:
+            raise ValueError("current_page must be a positive integer")
+
+    @staticmethod
+    def _validate_plant_type(plant_type: int) -> None:
+        """Validate HYXI plant type values."""
+        if plant_type not in _PLANT_TYPE_VALUES:
+            raise ValueError("plant_type must be one of: 1, 2, 3")
+
+    @staticmethod
+    def _validate_api_location(api_location: dict) -> None:
+        """Validate plant location payload."""
+        if not isinstance(api_location, dict):
+            raise ValueError("api_location must be a dictionary")
+
+    async def _request_plant_page(self, page_size: int, current_page: int) -> dict:
+        """Request a raw plant page response."""
+        self._validate_page(page_size, current_page)
+        _, res = await self._request(
+            "POST",
+            "/api/plant/v1/page",
+            json={"pageSize": int(page_size), "currentPage": int(current_page)},
+        )
+        return res
+
+    async def _request_plant_device_page(
+        self,
+        plant_id: str,
+        page_size: int,
+        current_page: int,
+        device_type: str = "",
+    ) -> dict:
+        """Request a raw plant device page response."""
+        self._validate_non_empty(plant_id, "plant_id")
+        self._validate_page(page_size, current_page)
+        body = {
+            "plantId": plant_id,
+            "deviceType": device_type,
+            "pageSize": int(page_size),
+            "currentPage": int(current_page),
+        }
+        _, res = await self._request("POST", "/api/plant/v1/devicePage", json=body)
+        return res
+
+    async def create_plant(
+        self,
+        time_zone: str,
+        plant_name: str,
+        plant_type: int,
+        capacity: int | float,
+        api_location: dict,
+    ) -> dict:
+        """Create a plant.
+
+        Endpoint: POST /api/plant/v1/create
+        """
+        self._validate_non_empty(time_zone, "time_zone")
+        self._validate_non_empty(plant_name, "plant_name")
+        self._validate_plant_type(plant_type)
+        self._validate_api_location(api_location)
+        if capacity <= 0:
+            raise ValueError("capacity must be a positive number")
+
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/create",
+            self.PlantError,
+            "create plant",
+            json={
+                "timeZone": time_zone,
+                "plantName": plant_name,
+                "plantType": int(plant_type),
+                "capacity": capacity,
+                "apiLocation": api_location,
+            },
+        )
+
+    async def configure_plant_price(
+        self,
+        plant_id: str,
+        price_type: int,
+        currency_unit: str,
+        fixed_price: int | float | None = None,
+        tou: dict | None = None,
+    ) -> dict:
+        """Configure plant electricity pricing.
+
+        Endpoint: POST /api/plant/v1/plantPrice
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        self._validate_non_empty(currency_unit, "currency_unit")
+        if price_type not in (1, 2):
+            raise ValueError("price_type must be one of: 1, 2")
+        if price_type == 1 and fixed_price is None:
+            raise ValueError("fixed_price is required when price_type is 1")
+        if price_type == 2 and tou is None:
+            raise ValueError("tou is required when price_type is 2")
+
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/plantPrice",
+            self.PlantError,
+            "configure plant price",
+            json={
+                "plantId": plant_id,
+                "priceType": int(price_type),
+                "fixedPrice": fixed_price,
+                "currencyUnit": currency_unit,
+                "tou": tou,
+            },
+        )
+
+    async def query_plant_list(
+        self, page_size: int = 10, current_page: int = 1
+    ) -> dict:
+        """Query plants visible to the authenticated account.
+
+        Endpoint: POST /api/plant/v1/page
+        """
+        self._validate_page(page_size, current_page)
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/page",
+            self.PlantError,
+            "query plant list",
+            json={"pageSize": int(page_size), "currentPage": int(current_page)},
+        )
+
+    async def query_plant_info(self, plant_id: str) -> dict:
+        """Query basic plant information.
+
+        Endpoint: GET /api/plant/v1/info
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        return await self._authenticated_api_request(
+            "GET",
+            "/api/plant/v1/info",
+            self.PlantError,
+            "query plant info",
+            params={"plantId": plant_id},
+        )
+
+    async def query_plant_device_page(
+        self,
+        plant_id: str,
+        device_type: str = "",
+        page_size: int = 20,
+        current_page: int = 1,
+    ) -> dict:
+        """Query devices under a plant.
+
+        Endpoint: POST /api/plant/v1/devicePage
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        self._validate_page(page_size, current_page)
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/devicePage",
+            self.PlantError,
+            "query plant devices",
+            json={
+                "plantId": plant_id,
+                "deviceType": device_type,
+                "pageSize": int(page_size),
+                "currentPage": int(current_page),
+            },
+        )
+
+    async def query_plant_power_generation(self, plant_id: str) -> dict:
+        """Query plant generation and consumption totals.
+
+        Endpoint: POST /api/plant/v1/queryPowerGeneration
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/queryPowerGeneration",
+            self.PlantError,
+            "query plant power generation",
+            json={"plantId": plant_id},
+        )
+
+    async def query_plant_yield_statistics(
+        self,
+        plant_id: str,
+        time_type: int,
+        start_time: str | int,
+    ) -> dict:
+        """Query plant yield statistics by day, month, or year.
+
+        Endpoint: POST /api/plant/v1/queryPlantYeildStatistics
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        if time_type not in _STATISTIC_TIME_TYPE_VALUES:
+            raise ValueError("time_type must be one of: 1, 2, 3")
+
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/queryPlantYeildStatistics",
+            self.PlantError,
+            "query plant yield statistics",
+            json={
+                "plantId": plant_id,
+                "timeType": int(time_type),
+                "startTime": start_time,
+            },
+        )
+
+    async def query_plant_power_statistics(
+        self, plant_id: str, start_time: str
+    ) -> dict:
+        """Query current-day plant power statistics.
+
+        Endpoint: POST /api/plant/v1/queryPlantPowerStatistics
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        self._validate_non_empty(start_time, "start_time")
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/queryPlantPowerStatistics",
+            self.PlantError,
+            "query plant power statistics",
+            json={"plantId": plant_id, "startTime": start_time},
+        )
+
+    async def query_plant_weather(self, plant_id: str, days: int) -> dict:
+        """Query plant weather for the next 1-7 days.
+
+        Endpoint: GET /api/plant/v1/weather
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        if not 1 <= days <= 7:
+            raise ValueError("days must be between 1 and 7")
+
+        return await self._authenticated_api_request(
+            "GET",
+            "/api/plant/v1/weather",
+            self.PlantError,
+            "query plant weather",
+            params={"plantId": plant_id, "days": int(days)},
+        )
+
+    async def update_plant(
+        self,
+        plant_id: str,
+        time_zone: str,
+        plant_name: str,
+        plant_type: int,
+        capacity: int | float,
+        api_location: dict,
+    ) -> dict:
+        """Modify plant information.
+
+        Endpoint: POST /api/plant/v1/update
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        self._validate_non_empty(time_zone, "time_zone")
+        self._validate_non_empty(plant_name, "plant_name")
+        self._validate_plant_type(plant_type)
+        self._validate_api_location(api_location)
+        if capacity <= 0:
+            raise ValueError("capacity must be a positive number")
+
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/update",
+            self.PlantError,
+            "update plant",
+            json={
+                "plantId": plant_id,
+                "timeZone": time_zone,
+                "plantName": plant_name,
+                "plantType": int(plant_type),
+                "capacity": capacity,
+                "apiLocation": api_location,
+            },
+        )
+
+    async def delete_plant(self, plant_id: str) -> dict:
+        """Delete a plant.
+
+        Endpoint: POST /api/plant/v1/delete
+        """
+        self._validate_non_empty(plant_id, "plant_id")
+        return await self._authenticated_api_request(
+            "POST",
+            "/api/plant/v1/delete",
+            self.PlantError,
+            "delete plant",
+            json={"plantId": plant_id},
+        )
